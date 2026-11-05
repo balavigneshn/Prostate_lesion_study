@@ -1,50 +1,129 @@
-import pandas as pd
+import nibabel as nib
 import numpy as np
+import pandas as pd
+
 from pathlib import Path
-from scipy.stats import spearmanr
+from radiomics import imageoperations
 
-root = Path(r"C:\Users\ADMIN\BALAVIGNESH N\Prostate_lesion_study")
-
-folder = (
-    root / "Radiomics_Results"
-    / "Clinical_Integration"
-    / "Patient_Level_Median"
-    / "Spearman_Clinical_Association"
+ROOT = Path(
+    r"C:\Users\ADMIN\BALAVIGNESH N\Prostate_lesion_study\Dataset"
 )
 
-df = pd.read_csv(folder / "spearman_all_bin_widths.csv")
-
-rho = df.pivot(
-    index="feature",
-    columns="bin_width",
-    values="spearman_rho"
+OUTPUT = Path(
+    r"C:\Users\ADMIN\BALAVIGNESH N\Prostate_lesion_study"
+    r"\Radiomics_Results\PET_ROI_Intensity_Audit"
 )
-rho.columns = rho.columns.astype(str)
 
-widths = ["0.03", "0.06", "0.125", "0.25", "0.5", "1.0"]
+OUTPUT.mkdir(parents=True, exist_ok=True)
 
-print("\n===== CLINICAL ASSOCIATION CONSISTENCY =====")
+BIN_WIDTHS = [0.03, 0.06, 0.125, 0.25, 0.5, 1.0]
 
-for i, w1 in enumerate(widths):
-    for w2 in widths[i + 1:]:
+DATASETS = [
+    ("imagesTr", "labelsTr_n"),
+    ("imagesTs", "labelsTs_n")
+]
 
-        pair = rho[[w1, w2]].dropna()
+rows = []
 
-        association_rho, p = spearmanr(
-            pair[w1], pair[w2]
+for image_folder, mask_folder in DATASETS:
+
+    image_dir = ROOT / image_folder
+    mask_dir = ROOT / mask_folder
+
+    mask_files = sorted(mask_dir.glob("*.nii.gz"))
+
+    print(f"\nProcessing {mask_folder}", flush=True)
+
+    for i, mask_path in enumerate(mask_files, start=1):
+
+        patient_id = mask_path.name.replace(".nii.gz", "")
+        pet_path = image_dir / f"{patient_id}_0001.nii.gz"
+
+        print(f"[{i}/{len(mask_files)}] {patient_id}", flush=True)
+
+        if not pet_path.exists():
+            continue
+
+        pet_img = nib.load(str(pet_path))
+        mask_img = nib.load(str(mask_path))
+
+        if pet_img.shape != mask_img.shape:
+            print("Shape mismatch:", patient_id)
+            continue
+
+        if not np.allclose(pet_img.affine, mask_img.affine, atol=1e-4):
+            print("Affine mismatch:", patient_id)
+            continue
+
+        pet = pet_img.get_fdata()
+        mask = mask_img.get_fdata()
+
+        labels = np.unique(mask)
+        labels = labels[labels > 0]
+
+        for label_value in labels:
+
+            roi_values = pet[mask == label_value]
+            roi_values = roi_values[np.isfinite(roi_values)]
+
+            if len(roi_values) == 0:
+                continue
+
+            row = {
+                "patient_id": patient_id,
+                "mask_label": int(label_value),
+                "ROI_voxels": len(roi_values)
+            }
+
+            for bw in BIN_WIDTHS:
+
+                edges = imageoperations.getBinEdges(
+                    roi_values,
+                    binWidth=bw
+                )
+
+                discretized = np.digitize(
+                    roi_values,
+                    edges
+                )
+
+                row[f"exact_levels_{bw}"] = len(
+                    np.unique(discretized)
+                )
+
+            rows.append(row)
+
+        # Save progress after each patient
+        pd.DataFrame(rows).to_csv(
+            OUTPUT / "exact_PyRadiomics_gray_level_counts.csv",
+            index=False
         )
 
-        sign_agreement = (
-            np.sign(pair[w1]) == np.sign(pair[w2])
-        ).mean() * 100
+df = pd.DataFrame(rows)
 
-        median_difference = (
-            pair[w1] - pair[w2]
-        ).abs().median()
+df["ROI_size_group"] = np.where(
+    df["ROI_voxels"] < 64,
+    "Small (<64 voxels)",
+    "Large (>=64 voxels)"
+)
 
-        print(
-            f"{w1} vs {w2}: "
-            f"rho agreement={association_rho:.3f}, "
-            f"sign agreement={sign_agreement:.1f}%, "
-            f"median |Δrho|={median_difference:.3f}"
-        )
+columns = [f"exact_levels_{bw}" for bw in BIN_WIDTHS]
+
+print("\n========== EXACT PYRADIOMICS RESULTS ==========")
+
+print("\nTotal ROIs:", len(df))
+print("Unique patients:", df["patient_id"].nunique())
+
+print("\nOverall median occupied levels:")
+print(df[columns].median())
+
+print("\nMedian occupied levels by ROI size:")
+print(df.groupby("ROI_size_group")[columns].median())
+
+print("\nMean occupied levels by ROI size:")
+print(df.groupby("ROI_size_group")[columns].mean())
+
+print("\nROI counts by size:")
+print(df["ROI_size_group"].value_counts())
+
+print("\nSaved:", OUTPUT / "exact_PyRadiomics_gray_level_counts.csv")
